@@ -22,16 +22,47 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "lwip/tcp.h"
+#include "stdint.h"
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+#define START_VAL 0xAAAA
+#define END_VAL   0xBB
+
+typedef struct __attribute__((packed)) {
+    // BLOCK 0 (10 Bytes)
+    uint16_t start_marker;
+    uint8_t  id_number;
+    uint16_t serial_no;
+    uint8_t  crc;
+    uint32_t packed_time;
+
+    // BLOCK 1 (4 Bytes)
+    uint8_t  type;
+    union {
+        struct { uint16_t input_number; uint8_t status; } digital;
+        struct { uint16_t channel_value; uint8_t channel_number; } analog;
+    } data;
+
+    // BLOCK 2 (2 Bytes)
+    uint8_t  shift_checksum;
+    uint8_t  end_marker;
+} GenericPacket_t; // data packet structure
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define MAX_RECORDS_PER_FRAME 20
+#define RECORD_SIZE 16
+
+#define ID_ANALOG  0x01 // id for analog records
+#define ID_DIGITAL 0x00 // id for digital records
 
 /* USER CODE END PD */
 
@@ -49,6 +80,34 @@ TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
 
+typedef struct __attribute__((packed)) {
+    GenericPacket_t records[MAX_RECORDS_PER_FRAME];
+} BulkFrame_t;
+
+uint8_t digital_state = 0;
+uint8_t last_digital_state = 0xFF;
+float last_analog_voltage = -1.0f;
+
+#define ANALOG_THRESHOLD 205
+
+struct tcp_pcb *test_pcb; // structure to manage the connection
+ip_addr_t DestIPaddr;     // variable to store your CPU's IP
+
+volatile uint8_t analog_ready = 0; // flag
+volatile uint8_t digital_ready = 0; // flag
+
+__attribute__((section(".RAM_D2"))) uint16_t adc_buffer[1]; // Memory alignment for H7 DMA
+
+BulkFrame_t bulkBuffer __attribute__((section(".LwipSection"), aligned(32)));
+
+uint16_t global_serial = 0;
+
+uint16_t record_count = 0;
+uint32_t last_flush_tick = 0;
+
+uint16_t current_event_idx = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,10 +120,25 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
+err_t send_analog(struct tcp_pcb *tpcb, uint16_t analog_data);
+err_t send_digital(struct tcp_pcb *tpcb, uint8_t digital_data);
+
+void Add_Event_To_Frame(uint8_t type, uint16_t id, uint16_t val);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void TCP_Client_Init(void) {
+    test_pcb = tcp_new();
+
+    if (test_pcb != NULL) {
+        IP4_ADDR(&DestIPaddr, 192, 168, 31, 133);
+        tcp_connect(test_pcb, &DestIPaddr, 5005, NULL);
+    }
+}
+
 
 /* USER CODE END 0 */
 
@@ -81,6 +155,12 @@ int main(void)
 
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
+
+//  /* Enable I-Cache */
+//  SCB_EnableICache();
+//
+//  /* Enable D-Cache */
+//  SCB_EnableDCache();
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -107,15 +187,92 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_Delay(200);
+
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc_buffer, 1);
+  HAL_Delay(200);
+  HAL_TIM_Base_Start(&htim2); // TIM2 TRGO triggers ADC2
+
+  HAL_TIM_Base_Start_IT(&htim3); // TIM3 IRQ triggers Callback
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+//  SCB_InvalidateDCache();
+
+//  HAL_Delay(3000);
+  TCP_Client_Init();
+
   while (1)
   {
+	  MX_LWIP_Process();
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+//	  if (digital_ready && test_pcb != NULL) {
+//		  digital_ready = 0;
+//		  if (digital_state!= last_digital_state){
+//			  send_digital(test_pcb, digital_state);
+//			  last_digital_state = digital_state;
+//		  }
+//
+//	  }
+
+//	  if (analog_ready && test_pcb != NULL) {
+//		  analog_ready = 0;
+//
+//		  uint16_t current_analog = adc_buffer[0];
+//
+//
+//		  uint16_t diff = (current_analog > last_analog_voltage) ?
+//						  (current_analog - last_analog_voltage) :
+//						  (last_analog_voltage - current_analog);
+//
+//		  if (diff > ANALOG_THRESHOLD) {
+//			  send_analog(test_pcb, current_analog);
+//			  last_analog_voltage = current_analog;
+//		  }
+//
+//	  }
+
+	  if (test_pcb != NULL && test_pcb->state == ESTABLISHED) {
+		  if (digital_ready){
+			  digital_ready = 0;
+			  uint16_t current_dig = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+			  if (current_dig != last_sent_digital) {
+				  send_digital_record(3, (uint8_t)current_dig); // Input ID 3
+				  last_sent_digital = current_dig;
+			  }
+		  }
+
+		  if (analog_ready){
+			  analog_ready=0;
+			  uint16_t current_analog = adc_buffer[0];
+
+
+			  uint16_t diff = (current_analog > last_analog_voltage) ?
+							  (current_analog - last_analog_voltage) :
+							  (last_analog_voltage - current_analog);
+
+			  if (diff > ANALOG_THRESHOLD) {
+				  send_analog_record(current_analog, 1);
+				  last_analog_voltage = current_analog;
+			  }
+		  }
+
+		  if (record_count > 0 && (HAL_GetTick() - last_flush_tick) > 50) {
+		          flush_bulk_buffer();
+		      }
+	  } else{
+		  TCP_Client_Init();
+		  HAL_Dealy(3000);
+	  }
+
   }
   /* USER CODE END 3 */
 }
@@ -387,6 +544,105 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+// Simple XOR-based CRC for Block 0
+uint8_t calculate_block0_crc(GenericPacket_t *p) {
+    uint8_t *ptr = (uint8_t*)p;
+    uint8_t crc = 0;
+    // Cover first 5 bytes (Start, ID, Serial) - skip CRC byte itself
+    for(int i=0; i < 5; i++) crc ^= ptr[i];
+    return crc;
+}
+
+// Shift Checksum: Sum of all bytes shifted by 1
+uint8_t calculate_shift_checksum(GenericPacket_t *p) {
+    uint8_t *ptr = (uint8_t*)p;
+    uint32_t sum = 0;
+    for(int i=0; i < 14; i++) { // Sum everything except Checksum and End
+        sum += ptr[i];
+    }
+    return (uint8_t)((sum >> 1) & 0xFF);
+}
+
+void flush_bulk_buffer(void) {
+    if (record_count == 0) return;
+
+    if (test_pcb != NULL && test_pcb->state == ESTABLISHED) {
+        uint16_t bytes_to_send = record_count * RECORD_SIZE;
+
+        if (tcp_sndbuf(test_pcb) >= bytes_to_send) {
+            tcp_write(test_pcb, &bulkBuffer, bytes_to_send, TCP_WRITE_FLAG_COPY);
+            tcp_output(test_pcb);
+
+            record_count = 0; // Empty the bucket
+            last_flush_tick = HAL_GetTick();
+        }
+    }
+}
+
+void add_to_bulk_buffer(GenericPacket_t *new_record) {
+    // Copy the record into the next available slot in the bucket
+    memcpy(&bulkBuffer.records[record_count], new_record, RECORD_SIZE);
+    record_count++;
+
+    // If bucket is full, send immediately
+    if (record_count >= MAX_RECORDS_PER_FRAME) {
+        flush_bulk_buffer();
+    }
+}
+
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM3) {
+        digital_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
+        __DMB();
+        digital_ready = 1;
+    }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC2) {
+    	__DMB();
+        analog_ready = 1;
+    }
+}
+
+
+void prepare_generic_header(GenericPacket_t *p) {
+    p->start_marker = 0xAAAA;
+    p->id_number = 1;
+    p->serial_no = global_serial++;
+    p->packed_time = HAL_GetTick();
+    p->end_marker = 0xBB;
+}
+
+void send_digital_record(uint16_t pin_num, uint8_t state) {
+    GenericPacket_t temp;
+    prepare_generic_header(&temp);
+    temp.type = 0x00;
+    temp.data.digital.input_number = pin_num;
+    temp.data.digital.status = state;
+
+    // Add validation bytes
+    temp.crc = calculate_block0_crc(&temp);
+    temp.shift_checksum = calculate_shift_checksum(&temp);
+
+    add_to_bulk_buffer(&temp);
+}
+
+void send_analog_record(uint16_t val, uint8_t chan_num) {
+    GenericPacket_t temp;
+    prepare_generic_header(&temp);
+    temp.type = 0x01;
+    temp.data.analog.channel_value = val;
+    temp.data.analog.channel_number = chan_num;
+
+    temp.crc = calculate_block0_crc(&temp);
+    temp.shift_checksum = calculate_shift_checksum(&temp);
+
+    add_to_bulk_buffer(&temp);
+}
+
 
 /* USER CODE END 4 */
 
