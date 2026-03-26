@@ -23,7 +23,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lwip/tcp.h"
-#include "stdint.h"
+#include <string.h>  // For memcpy
+#include <stdlib.h>
+
 
 /* USER CODE END Includes */
 
@@ -84,9 +86,12 @@ typedef struct __attribute__((packed)) {
     GenericPacket_t records[MAX_RECORDS_PER_FRAME];
 } BulkFrame_t;
 
-uint8_t digital_state = 0;
-uint8_t last_digital_state = 0xFF;
 float last_analog_voltage = -1.0f;
+uint8_t digital_state = 0;
+uint16_t last_digital_state = 0;
+uint16_t last_sent_analog = 0;
+uint32_t last_flush_tick = 0;
+/* USER CODE END PV */
 
 #define ANALOG_THRESHOLD 205
 
@@ -103,7 +108,6 @@ BulkFrame_t bulkBuffer __attribute__((section(".LwipSection"), aligned(32)));
 uint16_t global_serial = 0;
 
 uint16_t record_count = 0;
-uint32_t last_flush_tick = 0;
 
 uint16_t current_event_idx = 0;
 
@@ -120,8 +124,16 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
-err_t send_analog(struct tcp_pcb *tpcb, uint16_t analog_data);
-err_t send_digital(struct tcp_pcb *tpcb, uint8_t digital_data);
+//err_t send_analog(struct tcp_pcb *tpcb, uint16_t analog_data);
+//void send_analog_record(uint16_t val, uint8_t chan_num);
+//void send_digital_record(uint16_t pin_num, uint8_t state);
+//err_t send_digital(struct tcp_pcb *tpcb, uint8_t digital_data);
+
+void send_digital_record(uint16_t pin_num, uint8_t state);
+void send_analog_record(uint16_t val, uint8_t chan_num);
+void flush_bulk_buffer(void);
+uint8_t calculate_block0_crc(GenericPacket_t *p);
+uint8_t calculate_shift_checksum(GenericPacket_t *p);
 
 void Add_Event_To_Frame(uint8_t type, uint16_t id, uint16_t val);
 
@@ -244,9 +256,9 @@ int main(void)
 		  if (digital_ready){
 			  digital_ready = 0;
 			  uint16_t current_dig = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-			  if (current_dig != last_sent_digital) {
+			  if (current_dig != last_digital_state) {
 				  send_digital_record(3, (uint8_t)current_dig); // Input ID 3
-				  last_sent_digital = current_dig;
+				  last_digital_state = current_dig;
 			  }
 		  }
 
@@ -270,7 +282,7 @@ int main(void)
 		      }
 	  } else{
 		  TCP_Client_Init();
-		  HAL_Dealy(3000);
+		  HAL_Delay(3000);
 	  }
 
   }
@@ -564,7 +576,7 @@ uint8_t calculate_shift_checksum(GenericPacket_t *p) {
     return (uint8_t)((sum >> 1) & 0xFF);
 }
 
-void flush_bulk_buffer(void) {
+void flush_bulk_buffer() {
     if (record_count == 0) return;
 
     if (test_pcb != NULL && test_pcb->state == ESTABLISHED) {
